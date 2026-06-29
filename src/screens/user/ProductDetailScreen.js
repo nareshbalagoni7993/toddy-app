@@ -12,15 +12,17 @@ const { width } = Dimensions.get('window');
 
 export default function ProductDetailScreen({ route, navigation }) {
   const { product } = route.params;
-  const { cart, addToCart, updateQuantity, morningStock, eveningStock } = useContext(AppContext);
+  const { cart, addToCart, updateQuantity, stock } = useContext(AppContext);
 
   const [activeImg, setActiveImg] = useState(0);
   const imgScrollRef = useRef(null);
 
-  const cartItem = cart.find((item) => item.id === product.id);
+  const cartItem = cart.find((item) => item._id === product._id || item.id === product.id);
   const cartQty = cartItem ? cartItem.quantity : 0;
 
   const hour = new Date().getHours();
+  const morningStock = stock?.morningStock ?? 50;
+  const eveningStock = stock?.eveningStock ?? 40;
   const availableStock = hour < 12 ? morningStock : eveningStock;
   const isToddy = product.category === 'toddy';
   const isOutOfStock = !product.availability || (isToddy && availableStock === 0);

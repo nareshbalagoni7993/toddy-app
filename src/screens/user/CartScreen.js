@@ -25,7 +25,7 @@ function calcDeliveryCharge(km) {
 export default function CartScreen({ navigation }) {
   const {
     cart, updateQuantity, cartTotal, placeOrder,
-    morningStock, eveningStock, shopLocation, selectedAdmin,
+    stock, selectedAdmin,
   } = useContext(AppContext);
 
   const { coords, address, distance, loading: locLoading, error: locError, detect, reset } = useLocation();
@@ -45,6 +45,8 @@ export default function CartScreen({ navigation }) {
 
   const toddyQty = cart.filter((i) => i.category === 'toddy').reduce((s, i) => s + i.quantity, 0);
   const hour = new Date().getHours();
+  const morningStock = stock?.morningStock ?? 50;
+  const eveningStock = stock?.eveningStock ?? 40;
   const availableStock = hour < 12 ? morningStock : eveningStock;
 
   // ── Validation ──────────────────────────────────────────────────────────────
@@ -103,8 +105,8 @@ export default function CartScreen({ navigation }) {
         deliveryAddress: coords
           ? { ...address, latitude: coords.latitude, longitude: coords.longitude }
           : null,
-        shopAddress: shopLocation.address,
-        shopName: shopLocation.name,
+        shopAddress: selectedAdmin?.address,
+        shopName: selectedAdmin?.shopName,
         distanceKm: Number(km.toFixed(2)),
         deliveryCharge,
         subtotal: cartTotal,
@@ -113,7 +115,7 @@ export default function CartScreen({ navigation }) {
           ? (km <= 1 ? '20-30 min' : '30-45 min')
           : 'Ready in 15 min',
       });
-      navigation.replace('OrderSuccess', { orderId: order.id });
+      navigation.replace('OrderSuccess', { orderId: order.orderId || order._id });
     } catch {
       Alert.alert('Error', 'Failed to place order. Please try again.');
     } finally {
@@ -122,7 +124,10 @@ export default function CartScreen({ navigation }) {
   };
 
   const openMaps = () => {
-    const url = `https://maps.google.com/?q=${shopLocation.latitude},${shopLocation.longitude}`;
+    const lat = selectedAdmin?.latitude;
+    const lon = selectedAdmin?.longitude;
+    if (!lat || !lon) return;
+    const url = `https://maps.google.com/?q=${lat},${lon}`;
     Linking.openURL(url).catch(() => Alert.alert('Maps', 'Could not open Google Maps'));
   };
 
@@ -280,7 +285,7 @@ export default function CartScreen({ navigation }) {
               <Text style={[s.optName, deliveryType === 'pickup' && s.optNameActive]}>
                 Self Pickup — Free
               </Text>
-              <Text style={s.optDesc} numberOfLines={2}>{shopLocation.address || shopLocation.name}</Text>
+              <Text style={s.optDesc} numberOfLines={2}>{selectedAdmin?.address || selectedAdmin?.shopName || 'Shop address'}</Text>
             </View>
             {deliveryType === 'pickup' ? (
               <Ionicons name="checkmark-circle" size={20} color={COLORS.primaryLight} />
@@ -334,8 +339,8 @@ export default function CartScreen({ navigation }) {
               <TouchableOpacity
                 style={s.detectBtn}
                 onPress={() => detect(
-                selectedAdmin?.latitude ?? shopLocation.latitude,
-                selectedAdmin?.longitude ?? shopLocation.longitude
+                selectedAdmin?.latitude,
+                selectedAdmin?.longitude
               )}
                 disabled={locLoading}
                 activeOpacity={0.85}

@@ -12,10 +12,8 @@ import AdminProductsScreen from '../screens/admin/AdminProductsScreen';
 const Tab = createBottomTabNavigator();
 
 export default function AdminNavigator() {
-  const { getAdminOrders } = useContext(AppContext);
-  // Badge shows only this admin's pending orders
-  const adminOrders = getAdminOrders();
-  const pendingCount = adminOrders.filter(
+  const { orders } = useContext(AppContext);
+  const pendingCount = orders.filter(
     (o) => o.status === 'placed' || o.status === 'accepted'
   ).length;
 

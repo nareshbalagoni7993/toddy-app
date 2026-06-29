@@ -28,7 +28,8 @@ const EMPTY_PRODUCT = {
 };
 
 export default function AdminProductsScreen() {
-  const { products, updateProducts } = useContext(AppContext);
+  const { products, createProduct, updateProduct: ctxUpdateProduct, toggleProduct, deleteProduct: ctxDeleteProduct, loadProducts, user } = useContext(AppContext);
+  const [saving, setSaving] = useState(false);
 
   const [modalVisible, setModalVisible] = useState(false);
   const [isAdding, setIsAdding] = useState(false);
@@ -38,7 +39,7 @@ export default function AdminProductsScreen() {
     setEditData({
       ...product,
       price: String(product.price),
-      stock: String(product.stock),
+      stock: String(product.stock ?? ''),
     });
     setIsAdding(false);
     setModalVisible(true);
@@ -55,55 +56,65 @@ export default function AdminProductsScreen() {
     setEditData(null);
   };
 
-  const toggleAvailability = (id) => {
-    const updated = products.map((p) => p.id === id ? { ...p, availability: !p.availability } : p);
-    updateProducts(updated);
+  const toggleAvailability = async (id) => {
+    try {
+      await toggleProduct(id);
+    } catch {
+      Alert.alert('Error', 'Failed to toggle product availability.');
+    }
   };
 
-  const validateAndSave = () => {
+  const validateAndSave = async () => {
     const price = parseFloat(editData.price);
-    const stock = parseInt(editData.stock, 10);
+    const stockVal = parseInt(editData.stock, 10);
 
     if (!editData.name.trim()) { Alert.alert('Error', 'Product name is required.'); return; }
     if (isNaN(price) || price < 0) { Alert.alert('Error', 'Enter a valid price.'); return; }
-    if (isNaN(stock) || stock < 0) { Alert.alert('Error', 'Enter a valid stock number.'); return; }
 
     const productData = {
-      ...editData,
+      name: editData.name.trim(),
+      category: editData.category || 'toddy',
       price,
-      stock,
-      images: editData.images || [editData.image],
+      unitSize: editData.unitSize || '',
+      image: editData.image || '',
+      description: editData.description || '',
+      availability: editData.availability !== false,
+      stock: isNaN(stockVal) ? 0 : stockVal,
+      session: editData.session || 'all',
+      isFeatured: editData.isFeatured || false,
     };
 
-    if (isAdding) {
-      const newProduct = {
-        ...productData,
-        id: String(Date.now()),
-        images: [editData.image || `https://picsum.photos/seed/${editData.name}/600/600`],
-        image: editData.image || `https://picsum.photos/seed/${editData.name}/600/600`,
-      };
-      updateProducts([...products, newProduct]);
-      Alert.alert('✓ Added', `${newProduct.name} has been added to the catalog.`);
-    } else {
-      const updated = products.map((p) => p.id === editData.id ? productData : p);
-      updateProducts(updated);
-      Alert.alert('✓ Saved', `${editData.name} has been updated.`);
+    setSaving(true);
+    try {
+      if (isAdding) {
+        await createProduct(productData);
+        Alert.alert('Added', `${productData.name} has been added to the catalog.`);
+      } else {
+        await ctxUpdateProduct(editData._id, productData);
+        Alert.alert('Saved', `${editData.name} has been updated.`);
+      }
+      closeModal();
+    } catch (err) {
+      Alert.alert('Error', err.response?.data?.message || 'Failed to save product.');
+    } finally {
+      setSaving(false);
     }
-    closeModal();
   };
 
-  const deleteProduct = (product) => {
+  const handleDeleteProduct = (product) => {
     Alert.alert(
       'Delete Product',
       `Delete "${product.name}" from the catalog? This cannot be undone.`,
       [
         { text: 'Cancel', style: 'cancel' },
         {
-          text: 'Delete',
-          style: 'destructive',
-          onPress: () => {
-            const updated = products.filter((p) => p.id !== product.id);
-            updateProducts(updated);
+          text: 'Delete', style: 'destructive',
+          onPress: async () => {
+            try {
+              await ctxDeleteProduct(product._id);
+            } catch {
+              Alert.alert('Error', 'Failed to delete product.');
+            }
           },
         },
       ]
@@ -138,14 +149,14 @@ export default function AdminProductsScreen() {
       <View style={s.controls}>
         <Switch
           value={item.availability}
-          onValueChange={() => toggleAvailability(item.id)}
+          onValueChange={() => toggleAvailability(item._id)}
           trackColor={{ false: 'rgba(255,255,255,0.1)', true: 'rgba(45,134,83,0.5)' }}
           thumbColor={item.availability ? COLORS.primaryLight : COLORS.textMuted}
         />
         <TouchableOpacity style={s.iconBtn} onPress={() => openEdit(item)} activeOpacity={0.85}>
           <Ionicons name="create-outline" size={18} color={COLORS.accent} />
         </TouchableOpacity>
-        <TouchableOpacity style={s.iconBtn} onPress={() => deleteProduct(item)} activeOpacity={0.85}>
+        <TouchableOpacity style={s.iconBtn} onPress={() => handleDeleteProduct(item)} activeOpacity={0.85}>
           <Ionicons name="trash-outline" size={18} color="#ef5350" />
         </TouchableOpacity>
       </View>
@@ -176,7 +187,7 @@ export default function AdminProductsScreen() {
 
       <FlatList
         data={products}
-        keyExtractor={(p) => p.id}
+        keyExtractor={(p) => p._id || p.id}
         renderItem={renderItem}
         contentContainerStyle={s.list}
         showsVerticalScrollIndicator={false}

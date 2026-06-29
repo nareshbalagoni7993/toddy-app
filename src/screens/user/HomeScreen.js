@@ -27,7 +27,8 @@ import OrderCutoffBanner from '../../components/home/OrderCutoffBanner';
 const { width } = Dimensions.get('window');
 
 export default function HomeScreen({ navigation }) {
-  const { cart, addToCart, unreadCount, products, favorites, selectedAdmin } = useContext(AppContext);
+  const { cart, addToCart, unreadCount, products, selectedAdmin, loadProducts } = useContext(AppContext);
+  const favorites = []; // favorites feature not yet implemented in API
   const [selectedCategory, setSelectedCategory] = useState('all');
   const [userLocation, setUserLocation] = useState('Detecting...');
   const [locLoading, setLocLoading] = useState(true);

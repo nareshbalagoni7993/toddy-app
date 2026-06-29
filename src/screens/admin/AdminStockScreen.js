@@ -8,7 +8,9 @@ import { COLORS, FONTS, SPACING, RADIUS, SHADOWS } from '../../constants/theme';
 import { AppContext } from '../../context/AppContext';
 
 export default function AdminStockScreen() {
-  const { morningStock, eveningStock, updateStock } = useContext(AppContext);
+  const { stock, updateStock } = useContext(AppContext);
+  const morningStock = stock?.morningStock ?? 50;
+  const eveningStock = stock?.eveningStock ?? 40;
   const [morning, setMorning] = useState(String(morningStock));
   const [evening, setEvening] = useState(String(eveningStock));
   const [saving, setSaving] = useState(false);

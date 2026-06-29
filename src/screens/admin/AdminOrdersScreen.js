@@ -1,7 +1,7 @@
 import React, { useContext, useState } from 'react';
 import {
   View, Text, FlatList, TouchableOpacity, StyleSheet, StatusBar,
-  Alert, Image, Linking, ScrollView, TextInput, Modal,
+  Alert, Image, Linking, ScrollView, TextInput, Modal, RefreshControl,
 } from 'react-native';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Ionicons } from '@expo/vector-icons';
@@ -31,17 +31,21 @@ function fmtDate(iso) {
 }
 
 export default function AdminOrdersScreen() {
-  const { getAdminOrders, updateOrderStatus } = useContext(AppContext);
+  const { orders, updateOrderStatus, loadOrders } = useContext(AppContext);
   const [filter, setFilter] = useState('All');
   const [expanded, setExpanded] = useState(null);
   const [rejectModal, setRejectModal] = useState(false);
   const [rejectOrderId, setRejectOrderId] = useState(null);
   const [rejectReason, setRejectReason] = useState('');
+  const [refreshing, setRefreshing] = useState(false);
 
-  // Only show this admin's orders
-  const adminOrders = getAdminOrders();
+  const onRefresh = async () => {
+    setRefreshing(true);
+    await loadOrders();
+    setRefreshing(false);
+  };
 
-  const filteredOrders = adminOrders.filter((o) => {
+  const filteredOrders = orders.filter((o) => {
     if (filter === 'All') return true;
     if (filter === 'Pending') return o.status === 'placed';
     if (filter === 'Active') return ['accepted', 'preparing', 'ready', 'out_for_delivery'].includes(o.status);
@@ -53,10 +57,10 @@ export default function AdminOrdersScreen() {
   const confirmStatusChange = (order, newStatus, label) => {
     Alert.alert(
       'Confirm Action',
-      `Set order ${order.id} to "${label}"?`,
+      `Set order ${order.orderId || order._id} to "${label}"?`,
       [
         { text: 'No', style: 'cancel' },
-        { text: 'Yes', onPress: () => updateOrderStatus(order.id, newStatus) },
+        { text: 'Yes', onPress: () => updateOrderStatus(order._id, newStatus) },
       ]
     );
   };
@@ -78,7 +82,7 @@ export default function AdminOrdersScreen() {
     setExpanded(null);
   };
 
-  const confirmCancel = (order) => openRejectModal(order.id);
+  const confirmCancel = (order) => openRejectModal(order._id);
 
   const openMaps = (lat, lon) => {
     const url = `https://maps.google.com/?q=${lat},${lon}`;
@@ -96,9 +100,9 @@ export default function AdminOrdersScreen() {
             label="✓ Accept Order"
             color="#4caf50"
             onPress={() => {
-              Alert.alert('Accept Order', `Accept order ${item.id}?`, [
+              Alert.alert('Accept Order', `Accept order ${item.orderId || item._id}?`, [
                 { text: 'No', style: 'cancel' },
-                { text: 'Accept', style: 'default', onPress: () => updateOrderStatus(item.id, 'accepted') },
+                { text: 'Accept', style: 'default', onPress: () => updateOrderStatus(item._id, 'accepted') },
               ]);
             }}
           />
@@ -106,7 +110,7 @@ export default function AdminOrdersScreen() {
             label="✗ Reject"
             color="#ef5350"
             outline
-            onPress={() => openRejectModal(item.id)}
+            onPress={() => openRejectModal(item._id)}
           />
         </View>
       );
@@ -162,7 +166,7 @@ export default function AdminOrdersScreen() {
   };
 
   const renderItem = ({ item }) => {
-    const isExpanded = expanded === item.id;
+    const isExpanded = expanded === item._id;
     const meta = STATUS_META[item.status] || STATUS_META.placed;
     const isDone = item.status === 'delivered' || item.status === 'cancelled';
     const hasMap = item.deliveryAddress?.latitude && item.deliveryAddress?.longitude;
@@ -170,13 +174,13 @@ export default function AdminOrdersScreen() {
     return (
       <TouchableOpacity
         style={[s.orderCard, isExpanded && s.orderCardExpanded]}
-        onPress={() => setExpanded(isExpanded ? null : item.id)}
+        onPress={() => setExpanded(isExpanded ? null : item._id)}
         activeOpacity={0.88}
       >
         {/* ── Order Header ─────────────────────────────────────────────── */}
         <View style={s.orderTop}>
           <View style={s.orderIdRow}>
-            <Text style={s.orderId}>{item.id}</Text>
+            <Text style={s.orderId}>{item.orderId || item._id?.slice(-8)}</Text>
             <View style={[s.statusPill, { backgroundColor: meta.color + '22' }]}>
               <Ionicons name={meta.icon} size={11} color={meta.color} />
               <Text style={[s.statusText, { color: meta.color }]}>{meta.label}</Text>
@@ -185,7 +189,7 @@ export default function AdminOrdersScreen() {
           <View style={s.orderSummary}>
             <View style={s.summaryItem}>
               <Ionicons name="call-outline" size={13} color={COLORS.textMuted} />
-              <Text style={s.summaryText}>{item.customer?.phone || '—'}</Text>
+              <Text style={s.summaryText}>{item.customer?.phone || item.userId?.phone || '—'}</Text>
             </View>
             <View style={s.summaryItem}>
               <Ionicons name={item.deliveryType === 'home' ? 'bicycle-outline' : 'walk-outline'} size={13} color={COLORS.textMuted} />
@@ -318,7 +322,7 @@ export default function AdminOrdersScreen() {
     );
   };
 
-  const pendingCount = adminOrders.filter((o) => o.status === 'placed').length;
+  const pendingCount = orders.filter((o) => o.status === 'placed').length;
 
   return (
     <View style={s.container}>
@@ -367,10 +371,13 @@ export default function AdminOrdersScreen() {
       ) : (
         <FlatList
           data={filteredOrders}
-          keyExtractor={(o) => o.id}
+          keyExtractor={(o) => o._id}
           renderItem={renderItem}
           contentContainerStyle={s.list}
           showsVerticalScrollIndicator={false}
+          refreshControl={
+            <RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={COLORS.primaryLight} />
+          }
         />
       )}
 

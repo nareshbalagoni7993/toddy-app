@@ -38,16 +38,24 @@ function StarRating({ rating }) {
 }
 
 export default function ShopSelectionScreen({ navigation, route }) {
-  const { adminRegistry, selectAdmin, selectedAdmin } = useContext(AppContext);
+  const { nearbyShops, loadNearbyShops, selectShop, selectedAdmin } = useContext(AppContext);
   const [userCoords, setUserCoords] = useState(null);
   const [locLoading, setLocLoading] = useState(true);
-  const [selecting, setSelecting] = useState(null); // adminId being selected
+  const [shopsLoading, setShopsLoading] = useState(false);
+  const [selecting, setSelecting] = useState(null); // shop._id being selected
 
   const returnTo = route?.params?.returnTo || null;
 
   useEffect(() => {
     detectUserLocation();
+    if (nearbyShops.length === 0) fetchShops();
   }, []);
+
+  const fetchShops = async () => {
+    setShopsLoading(true);
+    await loadNearbyShops();
+    setShopsLoading(false);
+  };
 
   const detectUserLocation = async () => {
     setLocLoading(true);
@@ -68,9 +76,9 @@ export default function ShopSelectionScreen({ navigation, route }) {
   };
 
   const handleSelect = async (shop) => {
-    setSelecting(shop.id);
+    setSelecting(shop._id);
     try {
-      await selectAdmin(shop.id);
+      await selectShop(shop);
       if (returnTo) {
         navigation.navigate(returnTo);
       } else {
@@ -89,7 +97,7 @@ export default function ShopSelectionScreen({ navigation, route }) {
   };
 
   // Sort shops by distance (nearest first) if location available
-  const sortedShops = [...adminRegistry].sort((a, b) => {
+  const sortedShops = [...nearbyShops].sort((a, b) => {
     const da = getDistance(a);
     const db = getDistance(b);
     if (da === null && db === null) return 0;
@@ -131,15 +139,21 @@ export default function ShopSelectionScreen({ navigation, route }) {
 
       <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={ss.scroll}>
 
+        {shopsLoading && nearbyShops.length === 0 && (
+          <ActivityIndicator size="large" color={COLORS.primaryLight} style={{ marginTop: 60 }} />
+        )}
+
         {sortedShops.map((shop) => {
           const distKm = getDistance(shop);
-          const isSelected = selectedAdmin?.id === shop.id;
-          const isSelecting = selecting === shop.id;
+          const shopId = shop._id || shop.id;
+          const selectedId = selectedAdmin?._id || selectedAdmin?.id;
+          const isSelected = selectedId && selectedId === shopId;
+          const isSelecting = selecting === shopId;
           const canDeliver = distKm !== null ? distKm <= shop.deliveryRadius : true;
 
           return (
             <View
-              key={shop.id}
+              key={shopId}
               style={[ss.shopCard, isSelected && ss.shopCardSelected]}
             >
               {/* Selected badge */}
@@ -203,21 +217,23 @@ export default function ShopSelectionScreen({ navigation, route }) {
               </View>
 
               {/* Specialties */}
-              <View style={ss.specialtiesWrap}>
-                {shop.specialties.slice(0, 4).map((s, i) => (
-                  <View key={i} style={ss.specialtyChip}>
-                    <Text style={ss.specialtyText}>{s}</Text>
-                  </View>
-                ))}
-                {shop.specialties.length > 4 && (
-                  <View style={ss.specialtyChip}>
-                    <Text style={ss.specialtyText}>+{shop.specialties.length - 4} more</Text>
-                  </View>
-                )}
-              </View>
+              {shop.specialties?.length > 0 && (
+                <View style={ss.specialtiesWrap}>
+                  {(shop.specialties || []).slice(0, 4).map((s, i) => (
+                    <View key={i} style={ss.specialtyChip}>
+                      <Text style={ss.specialtyText}>{s}</Text>
+                    </View>
+                  ))}
+                  {shop.specialties.length > 4 && (
+                    <View style={ss.specialtyChip}>
+                      <Text style={ss.specialtyText}>+{shop.specialties.length - 4} more</Text>
+                    </View>
+                  )}
+                </View>
+              )}
 
               {/* Description */}
-              <Text style={ss.desc}>{shop.description}</Text>
+              {!!shop.description && <Text style={ss.desc}>{shop.description}</Text>}
 
               {/* Select Button */}
               <TouchableOpacity

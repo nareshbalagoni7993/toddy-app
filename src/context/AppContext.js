@@ -1,478 +1,400 @@
-import React, { createContext, useState, useCallback, useEffect, useContext } from 'react';
+import React, { createContext, useState, useCallback, useEffect, useRef, useContext } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { PRODUCTS, SHOP_INFO, ADMIN_REGISTRY } from '../constants/data';
+import { authAPI, ordersAPI, productsAPI, adminAPI, notificationsAPI, shopsAPI } from '../config/api';
+import { connectSocket, disconnectSocket, getSocket } from '../config/socket';
 
 export const AppContext = createContext({});
 
-// Admin phones — must match ADMIN_REGISTRY phones
-export const ADMIN_PHONES = ADMIN_REGISTRY.map((a) => a.phone);
-
-export function generateOrderId() {
-  const now = new Date();
-  const d = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}`;
-  const r = Math.random().toString(36).substring(2, 6).toUpperCase();
-  return `TC-${d}-${r}`;
-}
-
-async function scheduleNotif(title, body, data = {}) {
-  try {
-    const Notif = require('expo-notifications');
-    await Notif.scheduleNotificationAsync({
-      content: { title, body, data },
-      trigger: { seconds: 1 },
-    });
-  } catch {}
-}
-
-function statusLabel(s) {
-  const map = {
-    placed: 'Order Placed',
-    accepted: 'Accepted',
-    preparing: 'Preparing',
-    ready: 'Ready for Pickup/Delivery',
-    out_for_delivery: 'Out For Delivery',
-    delivered: 'Delivered',
-    cancelled: 'Cancelled',
-  };
-  return map[s] || s;
-}
-
 export function AppProvider({ children }) {
-  const [cart, setCart] = useState([]);
-  const [orders, setOrders] = useState([]);
+  // ── Auth state ──────────────────────────────────────────────────────────────
   const [user, setUser] = useState(null);
-  const [role, setRole] = useState('user');
-  const [products, setProducts] = useState(PRODUCTS);
-  const [morningStock, setMorningStock] = useState(50);
-  const [eveningStock, setEveningStock] = useState(40);
-  const [selectedAdmin, setSelectedAdminState] = useState(null);
-  const [shopLocation, setShopLocationState] = useState({
-    latitude: SHOP_INFO.latitude,
-    longitude: SHOP_INFO.longitude,
-    address: SHOP_INFO.address,
-    name: SHOP_INFO.name,
-  });
+  const [role, setRole] = useState(null); // 'super_admin' | 'admin' | 'user' | null
+  const [authLoading, setAuthLoading] = useState(true);
+
+  // ── Cart (local — not stored on server) ────────────────────────────────────
+  const [cart, setCart] = useState([]);
+  const [selectedAdmin, setSelectedAdmin] = useState(null); // selected shop object
+
+  // ── Data state ──────────────────────────────────────────────────────────────
+  const [orders, setOrders] = useState([]);
+  const [products, setProducts] = useState([]);
   const [notifications, setNotifications] = useState([]);
-  const [favorites, setFavorites] = useState([]);
+  const [unreadCount, setUnreadCount] = useState(0);
+  const [nearbyShops, setNearbyShops] = useState([]);
 
-  // ── Setup & Restore ─────────────────────────────────────────────────────────
+  // ── Admin dashboard state ───────────────────────────────────────────────────
+  const [adminDashboard, setAdminDashboard] = useState(null);
+  const [stock, setStock] = useState({ morningStock: 50, eveningStock: 40 });
+
+  const socketRef = useRef(null);
+
+  // ── Restore session on mount ──────────────────────────────────────────────
   useEffect(() => {
-    restore();
-    setupNotifHandler();
+    restoreSession();
   }, []);
 
-  const setupNotifHandler = async () => {
+  const restoreSession = async () => {
     try {
-      const Notif = require('expo-notifications');
-      const { status } = await Notif.requestPermissionsAsync();
-      if (status === 'granted') {
-        Notif.setNotificationHandler({
-          handleNotification: async () => ({
-            shouldShowAlert: true,
-            shouldPlaySound: true,
-            shouldSetBadge: true,
-          }),
-        });
+      const [token, storedUser, storedCart, storedAdmin] = await Promise.all([
+        AsyncStorage.getItem('tc_access_token'),
+        AsyncStorage.getItem('tc_user'),
+        AsyncStorage.getItem('tc_cart'),
+        AsyncStorage.getItem('tc_selected_admin'),
+      ]);
+
+      if (token && storedUser) {
+        const parsedUser = JSON.parse(storedUser);
+        setUser(parsedUser);
+        setRole(parsedUser.role);
+
+        // Connect Socket.IO with user info
+        socketRef.current = connectSocket(parsedUser);
+        setupSocketListeners(socketRef.current, parsedUser.role);
+
+        // Load initial data
+        await loadInitialData(parsedUser.role);
       }
-    } catch {}
+
+      if (storedCart) setCart(JSON.parse(storedCart));
+      if (storedAdmin) {
+        const parsedAdmin = JSON.parse(storedAdmin);
+        setSelectedAdmin(parsedAdmin);
+        // Pre-load products for the persisted shop
+        if (parsedAdmin && (parsedAdmin._id || parsedAdmin.id)) {
+          loadProducts(parsedAdmin._id || parsedAdmin.id).catch(() => {});
+        }
+      }
+    } catch (err) {
+      console.warn('[AppContext] Session restore error:', err.message);
+    } finally {
+      setAuthLoading(false);
+    }
   };
 
-  const restore = async () => {
-    try {
-      const keys = [
-        'tc_orders', 'tc_user', 'tc_role', 'tc_stock', 'tc_products',
-        'tc_shop', 'tc_notifs', 'tc_favorites', 'tc_selected_admin',
-      ];
-      const results = await AsyncStorage.multiGet(keys);
-      const map = Object.fromEntries(results.map(([k, v]) => [k, v]));
+  // ── Socket.IO event listeners ─────────────────────────────────────────────
+  function setupSocketListeners(socket, userRole) {
+    // Remove previous listeners to avoid duplicates
+    socket.off('new_order');
+    socket.off('order_updated');
+    socket.off('notification');
+    socket.off('admin_updated');
+    socket.off('account_status_changed');
 
-      if (map.tc_orders) setOrders(JSON.parse(map.tc_orders));
-      if (map.tc_user) setUser(JSON.parse(map.tc_user));
-      if (map.tc_role) setRole(map.tc_role);
-      if (map.tc_stock) {
-        const s = JSON.parse(map.tc_stock);
-        if (s.morning !== undefined) setMorningStock(s.morning);
-        if (s.evening !== undefined) setEveningStock(s.evening);
-      }
-      if (map.tc_products) setProducts(JSON.parse(map.tc_products));
-      if (map.tc_notifs) setNotifications(JSON.parse(map.tc_notifs));
-      if (map.tc_favorites) setFavorites(JSON.parse(map.tc_favorites));
-
-      if (map.tc_selected_admin) {
-        const admin = JSON.parse(map.tc_selected_admin);
-        setSelectedAdminState(admin);
-        setShopLocationState({
-          latitude: admin.latitude,
-          longitude: admin.longitude,
-          address: admin.address,
-          name: admin.shopName,
+    // Admin receives new order — update orders list in real-time
+    socket.on('new_order', ({ order }) => {
+      if (userRole === 'admin' || userRole === 'super_admin') {
+        setOrders((prev) => {
+          const exists = prev.find((o) => o._id === order._id || o.orderId === order.orderId);
+          if (exists) return prev;
+          return [order, ...prev];
         });
-      } else if (map.tc_shop) {
-        setShopLocationState(JSON.parse(map.tc_shop));
+        // Increment unread notification badge
+        setUnreadCount((prev) => prev + 1);
       }
-    } catch {}
+    });
+
+    // User receives order status update — update order in list
+    socket.on('order_updated', ({ order }) => {
+      setOrders((prev) =>
+        prev.map((o) => (o._id === order._id ? { ...o, ...order } : o))
+      );
+    });
+
+    // Any role receives in-app notification
+    socket.on('notification', ({ notification }) => {
+      setNotifications((prev) => [notification, ...prev]);
+      setUnreadCount((prev) => prev + 1);
+    });
+
+    // Admin profile was updated (for users to get fresh shop data)
+    socket.on('admin_updated', () => {
+      if (userRole === 'user') loadNearbyShops();
+    });
+
+    // Admin receives account status change
+    socket.on('account_status_changed', ({ isActive, message }) => {
+      if (!isActive) {
+        logoutUser();
+      }
+    });
+  }
+
+  // ── Load data by role ─────────────────────────────────────────────────────
+  const loadInitialData = async (userRole) => {
+    try {
+      if (userRole === 'user') {
+        await Promise.all([loadOrders(), loadNearbyShops(), loadNotifications()]);
+      } else if (userRole === 'admin') {
+        await Promise.all([loadOrders(), loadProducts(), loadStock(), loadNotifications()]);
+      } else if (userRole === 'super_admin') {
+        await loadNotifications();
+      }
+    } catch (err) {
+      console.warn('[AppContext] loadInitialData error:', err.message);
+    }
   };
 
-  // ── Admin Selection ──────────────────────────────────────────────────────────
-  const selectAdmin = useCallback(async (adminId) => {
-    const admin = ADMIN_REGISTRY.find((a) => a.id === adminId || a.phone === adminId);
-    if (!admin) return;
-    setSelectedAdminState(admin);
-    const shopLoc = {
-      latitude: admin.latitude,
-      longitude: admin.longitude,
-      address: admin.address,
-      name: admin.shopName,
-    };
-    setShopLocationState(shopLoc);
+  // ── Auth actions ──────────────────────────────────────────────────────────
+  const loginUser = useCallback(async (userData, accessToken, refreshToken) => {
     await AsyncStorage.multiSet([
-      ['tc_selected_admin', JSON.stringify(admin)],
-      ['tc_shop', JSON.stringify(shopLoc)],
+      ['tc_access_token', accessToken],
+      ['tc_refresh_token', refreshToken],
+      ['tc_user', JSON.stringify(userData)],
     ]);
-  }, []);
 
-  const clearSelectedAdmin = useCallback(async () => {
-    setSelectedAdminState(null);
-    await AsyncStorage.removeItem('tc_selected_admin');
-  }, []);
+    setUser(userData);
+    setRole(userData.role);
 
-  // ── Cart ────────────────────────────────────────────────────────────────────
-  const addToCart = useCallback((product) => {
-    setCart((prev) => {
-      const ex = prev.find((i) => i.id === product.id);
-      if (ex) return prev.map((i) => i.id === product.id ? { ...i, quantity: i.quantity + 1 } : i);
-      return [...prev, { ...product, quantity: 1 }];
-    });
-  }, []);
+    // Connect and listen on socket
+    const socket = connectSocket(userData);
+    socketRef.current = socket;
+    setupSocketListeners(socket, userData.role);
 
-  const removeFromCart = useCallback((id) => setCart((p) => p.filter((i) => i.id !== id)), []);
-
-  const updateQuantity = useCallback((id, qty) => {
-    if (qty <= 0) setCart((p) => p.filter((i) => i.id !== id));
-    else setCart((p) => p.map((i) => i.id === id ? { ...i, quantity: qty } : i));
-  }, []);
-
-  const clearCart = useCallback(() => setCart([]), []);
-
-  const cartTotal = cart.reduce((s, i) => s + i.price * i.quantity, 0);
-
-  // ── Orders ──────────────────────────────────────────────────────────────────
-  const placeOrder = useCallback(async (details) => {
-    const order = {
-      id: generateOrderId(),
-      items: [...cart],
-      status: 'placed',
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      statusHistory: [{ status: 'placed', time: new Date().toISOString(), label: 'Order Placed' }],
-      customer: { phone: user?.phone || 'Guest', name: user?.name || 'Customer' },
-      adminId: selectedAdmin?.phone || null,
-      adminName: selectedAdmin?.shopName || null,
-      ...details,
-    };
-
-    // Update orders using functional update (avoids stale closure)
-    setOrders((prev) => {
-      const updated = [order, ...prev];
-      AsyncStorage.setItem('tc_orders', JSON.stringify(updated)).catch(() => {});
-      return updated;
-    });
-
-    // Auto-decrease toddy stock — two independent setters, no nesting
-    const toddyQty = cart
-      .filter((i) => i.category === 'toddy')
-      .reduce((s, i) => s + i.quantity, 0);
-
-    if (toddyQty > 0) {
-      const isMorning = new Date().getHours() < 12;
-      if (isMorning) {
-        const newMorning = Math.max(0, morningStock - toddyQty);
-        setMorningStock(newMorning);
-        AsyncStorage.setItem('tc_stock', JSON.stringify({ morning: newMorning, evening: eveningStock })).catch(() => {});
-      } else {
-        const newEvening = Math.max(0, eveningStock - toddyQty);
-        setEveningStock(newEvening);
-        AsyncStorage.setItem('tc_stock', JSON.stringify({ morning: morningStock, evening: newEvening })).catch(() => {});
-      }
-    }
-
-    clearCart();
-
-    // In-app notification
-    const notif = {
-      id: Date.now().toString(),
-      title: '🍶 Order Placed!',
-      body: `${order.id} — Your order is placed. We'll confirm soon.`,
-      type: 'order_placed',
-      orderId: order.id,
-      time: new Date().toISOString(),
-      read: false,
-    };
-    setNotifications((prev) => {
-      const updated = [notif, ...prev];
-      AsyncStorage.setItem('tc_notifs', JSON.stringify(updated)).catch(() => {});
-      return updated;
-    });
-
-    await scheduleNotif(
-      '🍶 Order Placed!',
-      `Order ${order.id} confirmed. Estimated: 30–45 min`,
-      { orderId: order.id }
-    );
-
-    return order;
-  }, [cart, user, selectedAdmin, morningStock, eveningStock, clearCart]);
-
-  // Fixed: uses functional updates — no stale closure issues, empty deps array
-  const updateOrderStatus = useCallback(async (orderId, newStatus, rejectionReason) => {
-    setOrders((prev) => {
-      const updated = prev.map((o) => {
-        if (o.id !== orderId) return o;
-        return {
-          ...o,
-          status: newStatus,
-          updatedAt: new Date().toISOString(),
-          rejectionReason: rejectionReason || o.rejectionReason,
-          statusHistory: [
-            ...(o.statusHistory || []),
-            { status: newStatus, time: new Date().toISOString(), label: statusLabel(newStatus) },
-          ],
-        };
-      });
-      AsyncStorage.setItem('tc_orders', JSON.stringify(updated)).catch(() => {});
-      return updated;
-    });
-
-    const msgs = {
-      accepted: 'Your order has been accepted! 🎉 Preparing soon.',
-      preparing: 'Your toddy is being prepared now 🍶',
-      ready: 'Order is ready for pickup / out for delivery!',
-      out_for_delivery: 'Your order is on the way 🛵',
-      delivered: 'Order delivered! Enjoy your toddy 🍶',
-      cancelled: rejectionReason
-        ? `Your order was cancelled. Reason: ${rejectionReason}`
-        : 'Your order has been cancelled.',
-    };
-
-    if (msgs[newStatus]) {
-      const notif = {
-        id: Date.now().toString(),
-        title: newStatus === 'cancelled' ? '❌ Order Cancelled' : '🍶 Order Update',
-        body: msgs[newStatus],
-        type: `order_${newStatus}`,
-        orderId,
-        time: new Date().toISOString(),
-        read: false,
-      };
-      setNotifications((prev) => {
-        const updated = [notif, ...prev];
-        AsyncStorage.setItem('tc_notifs', JSON.stringify(updated)).catch(() => {});
-        return updated;
-      });
-      await scheduleNotif(notif.title, msgs[newStatus], { orderId });
-    }
-  }, []); // Empty deps — functional updates make this closure-safe
-
-  // ── Auth ────────────────────────────────────────────────────────────────────
-  const loginUser = useCallback(async (phone) => {
-    const adminProfile = ADMIN_REGISTRY.find((a) => a.phone === phone.trim());
-    const isAdmin = !!adminProfile;
-    const r = isAdmin ? 'admin' : 'user';
-    const u = {
-      phone,
-      name: isAdmin ? adminProfile.ownerName : 'Customer',
-      role: r,
-      adminId: isAdmin ? adminProfile.id : null,
-      shopName: isAdmin ? adminProfile.shopName : null,
-    };
-    setUser(u);
-    setRole(r);
-    if (isAdmin) {
-      // Sync shop location when admin logs in
-      setShopLocationState({
-        latitude: adminProfile.latitude,
-        longitude: adminProfile.longitude,
-        address: adminProfile.address,
-        name: adminProfile.shopName,
-      });
-    }
-    await AsyncStorage.setItem('tc_user', JSON.stringify(u));
-    await AsyncStorage.setItem('tc_role', r);
-    return r;
+    await loadInitialData(userData.role);
   }, []);
 
   const logoutUser = useCallback(async () => {
+    // Disconnect socket
+    disconnectSocket();
+    socketRef.current = null;
+
+    // Clear all local state
     setUser(null);
-    setRole('user');
+    setRole(null);
     setCart([]);
-    setSelectedAdminState(null);
+    setOrders([]);
+    setProducts([]);
     setNotifications([]);
-    await AsyncStorage.multiRemove(['tc_user', 'tc_role', 'tc_selected_admin', 'tc_notifs']);
+    setUnreadCount(0);
+    setSelectedAdmin(null);
+    setAdminDashboard(null);
+
+    await AsyncStorage.multiRemove([
+      'tc_access_token', 'tc_refresh_token', 'tc_user',
+      'tc_cart', 'tc_selected_admin',
+    ]);
   }, []);
 
-  // ── Favorites ───────────────────────────────────────────────────────────────
-  const toggleFavorite = useCallback(async (productId) => {
-    setFavorites((prev) => {
-      const updated = prev.includes(productId)
-        ? prev.filter((id) => id !== productId)
-        : [...prev, productId];
-      AsyncStorage.setItem('tc_favorites', JSON.stringify(updated)).catch(() => {});
+  // ── Cart actions (local only) ─────────────────────────────────────────────
+  const addToCart = useCallback((product) => {
+    setCart((prev) => {
+      const existing = prev.find((i) => i._id === product._id || i.id === product.id);
+      const updated = existing
+        ? prev.map((i) => (i._id === product._id || i.id === product.id ? { ...i, quantity: i.quantity + 1 } : i))
+        : [...prev, { ...product, quantity: 1 }];
+      AsyncStorage.setItem('tc_cart', JSON.stringify(updated)).catch(() => {});
       return updated;
     });
   }, []);
 
-  const isFavorite = useCallback((productId) => favorites.includes(productId), [favorites]);
+  const removeFromCart = useCallback((id) => {
+    setCart((prev) => {
+      const updated = prev.filter((i) => i._id !== id && i.id !== id);
+      AsyncStorage.setItem('tc_cart', JSON.stringify(updated)).catch(() => {});
+      return updated;
+    });
+  }, []);
 
-  const getFavoriteProducts = useCallback(
-    () => products.filter((p) => favorites.includes(p.id)),
-    [products, favorites]
-  );
+  const updateQuantity = useCallback((id, qty) => {
+    setCart((prev) => {
+      const updated = qty <= 0
+        ? prev.filter((i) => i._id !== id && i.id !== id)
+        : prev.map((i) => (i._id === id || i.id === id ? { ...i, quantity: qty } : i));
+      AsyncStorage.setItem('tc_cart', JSON.stringify(updated)).catch(() => {});
+      return updated;
+    });
+  }, []);
 
-  // ── Stock ───────────────────────────────────────────────────────────────────
+  const clearCart = useCallback(() => {
+    setCart([]);
+    AsyncStorage.removeItem('tc_cart').catch(() => {});
+  }, []);
+
+  const cartTotal = cart.reduce((s, i) => s + i.price * i.quantity, 0);
+
+  // ── Shop selection ────────────────────────────────────────────────────────
+  const selectShop = useCallback(async (shop) => {
+    setSelectedAdmin(shop);
+    await AsyncStorage.setItem('tc_selected_admin', JSON.stringify(shop));
+    // Load products for the newly selected shop
+    const adminId = shop._id || shop.id;
+    if (adminId) loadProducts(adminId);
+  }, [loadProducts]);
+
+  const clearSelectedShop = useCallback(async () => {
+    setSelectedAdmin(null);
+    await AsyncStorage.removeItem('tc_selected_admin');
+  }, []);
+
+  // ── Orders ────────────────────────────────────────────────────────────────
+  const loadOrders = useCallback(async (params = {}) => {
+    try {
+      const { data } = await ordersAPI.getAll(params);
+      setOrders(data.data || []);
+      return data.data;
+    } catch (err) {
+      console.warn('[AppContext] loadOrders:', err.message);
+      return [];
+    }
+  }, []);
+
+  const placeOrder = useCallback(async (orderData) => {
+    const { data } = await ordersAPI.place({
+      ...orderData,
+      adminId: selectedAdmin?._id || selectedAdmin?.id,
+    });
+    const newOrder = data.data;
+    setOrders((prev) => [newOrder, ...prev]);
+    clearCart();
+    return newOrder;
+  }, [selectedAdmin, clearCart]);
+
+  const updateOrderStatus = useCallback(async (orderId, status, rejectionReason) => {
+    const { data } = await ordersAPI.updateStatus(orderId, status, rejectionReason);
+    const updatedOrder = data.data;
+    setOrders((prev) => prev.map((o) => (o._id === orderId ? updatedOrder : o)));
+    return updatedOrder;
+  }, []);
+
+  // ── Products ──────────────────────────────────────────────────────────────
+  const loadProducts = useCallback(async (adminId) => {
+    try {
+      const id = adminId || user?.id;
+      if (!id) return [];
+      const { data } = await productsAPI.getByAdmin(id);
+      setProducts(data.data || []);
+      return data.data;
+    } catch (err) {
+      console.warn('[AppContext] loadProducts:', err.message);
+      return [];
+    }
+  }, [user]);
+
+  const createProduct = useCallback(async (productData) => {
+    const { data } = await productsAPI.create(productData);
+    setProducts((prev) => [data.data, ...prev]);
+    return data.data;
+  }, []);
+
+  const updateProduct = useCallback(async (id, productData) => {
+    const { data } = await productsAPI.update(id, productData);
+    setProducts((prev) => prev.map((p) => (p._id === id ? data.data : p)));
+    return data.data;
+  }, []);
+
+  const toggleProduct = useCallback(async (id) => {
+    const { data } = await productsAPI.toggle(id);
+    setProducts((prev) => prev.map((p) => (p._id === id ? data.data : p)));
+    return data.data;
+  }, []);
+
+  const deleteProduct = useCallback(async (id) => {
+    await productsAPI.delete(id);
+    setProducts((prev) => prev.filter((p) => p._id !== id));
+  }, []);
+
+  // ── Nearby Shops ──────────────────────────────────────────────────────────
+  const loadNearbyShops = useCallback(async () => {
+    try {
+      const { data } = await shopsAPI.getNearby();
+      setNearbyShops(data.data || []);
+      return data.data;
+    } catch (err) {
+      console.warn('[AppContext] loadNearbyShops:', err.message);
+      return [];
+    }
+  }, []);
+
+  // ── Stock ─────────────────────────────────────────────────────────────────
+  const loadStock = useCallback(async () => {
+    try {
+      const { data } = await adminAPI.getStock();
+      setStock(data.data);
+      return data.data;
+    } catch (err) {
+      console.warn('[AppContext] loadStock:', err.message);
+    }
+  }, []);
+
   const updateStock = useCallback(async (morning, evening) => {
-    setMorningStock(morning);
-    setEveningStock(evening);
-    await AsyncStorage.setItem('tc_stock', JSON.stringify({ morning, evening }));
+    const { data } = await adminAPI.updateStock({ morningStock: morning, eveningStock: evening });
+    setStock(data.data);
+    return data.data;
   }, []);
 
-  // ── Products ────────────────────────────────────────────────────────────────
-  const updateProducts = useCallback(async (prods) => {
-    setProducts(prods);
-    await AsyncStorage.setItem('tc_products', JSON.stringify(prods));
+  // ── Admin Dashboard ───────────────────────────────────────────────────────
+  const loadAdminDashboard = useCallback(async () => {
+    try {
+      const { data } = await adminAPI.getDashboard();
+      setAdminDashboard(data.data);
+      if (data.data.morningStock !== undefined) {
+        setStock({ morningStock: data.data.morningStock, eveningStock: data.data.eveningStock });
+      }
+      return data.data;
+    } catch (err) {
+      console.warn('[AppContext] loadAdminDashboard:', err.message);
+    }
   }, []);
 
-  const setShopLocation = useCallback(async (loc) => {
-    setShopLocationState(loc);
-    await AsyncStorage.setItem('tc_shop', JSON.stringify(loc));
+  // ── Notifications ─────────────────────────────────────────────────────────
+  const loadNotifications = useCallback(async () => {
+    try {
+      const { data } = await notificationsAPI.getAll();
+      setNotifications(data.data || []);
+      setUnreadCount(data.unreadCount || 0);
+      return data.data;
+    } catch (err) {
+      console.warn('[AppContext] loadNotifications:', err.message);
+    }
   }, []);
 
-  // ── Notifications ───────────────────────────────────────────────────────────
-  const markRead = useCallback(async (id) => {
-    setNotifications((prev) => {
-      const updated = prev.map((n) => n.id === id ? { ...n, read: true } : n);
-      AsyncStorage.setItem('tc_notifs', JSON.stringify(updated)).catch(() => {});
-      return updated;
-    });
+  const markNotifRead = useCallback(async (id) => {
+    await notificationsAPI.markRead(id);
+    setNotifications((prev) => prev.map((n) => (n._id === id ? { ...n, read: true } : n)));
+    setUnreadCount((prev) => Math.max(0, prev - 1));
   }, []);
 
-  const markAllRead = useCallback(async () => {
-    setNotifications((prev) => {
-      const updated = prev.map((n) => ({ ...n, read: true }));
-      AsyncStorage.setItem('tc_notifs', JSON.stringify(updated)).catch(() => {});
-      return updated;
-    });
+  const markAllNotifsRead = useCallback(async () => {
+    await notificationsAPI.markAllRead();
+    setNotifications((prev) => prev.map((n) => ({ ...n, read: true })));
+    setUnreadCount(0);
   }, []);
-
-  // ── Analytics ───────────────────────────────────────────────────────────────
-  // Returns orders visible to the currently logged-in admin
-  const getAdminOrders = useCallback(() => {
-    if (role !== 'admin' || !user) return [];
-    // Show orders placed with this admin, or orders with no adminId (legacy)
-    return orders.filter((o) => !o.adminId || o.adminId === user.phone);
-  }, [orders, role, user]);
-
-  const getTodayOrders = useCallback(() => {
-    const today = new Date().toDateString();
-    const src = role === 'admin' ? getAdminOrders() : orders;
-    return src.filter((o) => new Date(o.createdAt).toDateString() === today);
-  }, [orders, role, getAdminOrders]);
-
-  const getOrdersByStatus = useCallback(
-    (s) => {
-      const src = role === 'admin' ? getAdminOrders() : orders;
-      return src.filter((o) => o.status === s);
-    },
-    [orders, role, getAdminOrders]
-  );
-
-  const getTodayRevenue = useCallback(
-    () => getTodayOrders()
-      .filter((o) => o.status !== 'cancelled')
-      .reduce((sum, o) => sum + (o.total || 0), 0),
-    [getTodayOrders]
-  );
-
-  const getWeeklyRevenue = useCallback(() => {
-    const now = new Date();
-    const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-    const src = role === 'admin' ? getAdminOrders() : orders;
-    return src
-      .filter((o) => new Date(o.createdAt) >= weekAgo && o.status !== 'cancelled')
-      .reduce((s, o) => s + (o.total || 0), 0);
-  }, [orders, role, getAdminOrders]);
-
-  const getMonthlyRevenue = useCallback(() => {
-    const now = new Date();
-    const src = role === 'admin' ? getAdminOrders() : orders;
-    return src
-      .filter((o) => {
-        const d = new Date(o.createdAt);
-        return (
-          d.getMonth() === now.getMonth() &&
-          d.getFullYear() === now.getFullYear() &&
-          o.status !== 'cancelled'
-        );
-      })
-      .reduce((s, o) => s + (o.total || 0), 0);
-  }, [orders, role, getAdminOrders]);
-
-  const getTotalBottlesSold = useCallback(() => {
-    const src = role === 'admin' ? getAdminOrders() : orders;
-    return src
-      .filter((o) => o.status === 'delivered')
-      .flatMap((o) => o.items)
-      .filter((i) => i.category === 'toddy')
-      .reduce((s, i) => s + i.quantity, 0);
-  }, [orders, role, getAdminOrders]);
-
-  const getBestSellers = useCallback(() => {
-    const src = role === 'admin' ? getAdminOrders() : orders;
-    const counts = {};
-    src
-      .filter((o) => o.status === 'delivered')
-      .flatMap((o) => o.items)
-      .forEach((item) => {
-        counts[item.id] = (counts[item.id] || 0) + item.quantity;
-      });
-    return Object.entries(counts)
-      .sort(([, a], [, b]) => b - a)
-      .slice(0, 5)
-      .map(([id, qty]) => ({
-        product: products.find((p) => p.id === id),
-        soldQty: qty,
-      }))
-      .filter((x) => x.product);
-  }, [orders, products, role, getAdminOrders]);
-
-  const unreadCount = notifications.filter((n) => !n.read).length;
 
   return (
     <AppContext.Provider value={{
-      // State
-      cart, orders, user, role, products, morningStock, eveningStock,
-      shopLocation, notifications, unreadCount, cartTotal,
-      favorites, selectedAdmin,
-      // Admin registry
-      adminRegistry: ADMIN_REGISTRY,
-      // Cart actions
-      addToCart, removeFromCart, updateQuantity, clearCart,
-      // Order actions
-      placeOrder, updateOrderStatus,
       // Auth
+      user, role, authLoading,
       loginUser, logoutUser,
-      // Admin selection
-      selectAdmin, clearSelectedAdmin,
-      // Favorites
-      isFavorite, toggleFavorite, getFavoriteProducts,
-      // Stock & products
-      updateStock, updateProducts, setShopLocation,
+
+      // Cart
+      cart, cartTotal,
+      addToCart, removeFromCart, updateQuantity, clearCart,
+
+      // Selected shop
+      selectedAdmin,
+      selectShop, clearSelectedShop,
+
+      // Orders
+      orders,
+      loadOrders, placeOrder, updateOrderStatus,
+
+      // Products
+      products,
+      loadProducts, createProduct, updateProduct, toggleProduct, deleteProduct,
+
+      // Nearby shops
+      nearbyShops, loadNearbyShops,
+
+      // Stock
+      stock,
+      loadStock, updateStock,
+
+      // Admin Dashboard
+      adminDashboard, loadAdminDashboard,
+
       // Notifications
-      markRead, markAllRead,
-      // Analytics
-      getAdminOrders,
-      getTodayOrders, getOrdersByStatus, getTodayRevenue,
-      getWeeklyRevenue, getMonthlyRevenue, getTotalBottlesSold,
-      getBestSellers,
+      notifications, unreadCount,
+      loadNotifications, markNotifRead, markAllNotifsRead,
     }}>
       {children}
     </AppContext.Provider>
